@@ -1,6 +1,8 @@
-streamlit
-pandas
-numpy
-altair
+streamlit>=1.67   # light/dark mode and the email field need a recent version
+pandas>=2.0
+numpy>=1.26
+altair>=5.0
+matplotlib>=3.8
 requests
 holidays
+pytest>=8.0
