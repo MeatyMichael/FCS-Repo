@@ -1,5 +1,5 @@
 """
-BuildDB.py
+BuildDB_v2.py
 ----------
 Builds or updates the SQLite database "electricity_prices.db".
 
@@ -12,9 +12,10 @@ data and stores everything the app works with.
 Market data (updated on every run, older values are reused):
   prices_ch          Day-ahead price Switzerland per hour             (Energy-Charts API)
   prices_de          Day-ahead price Germany/Luxembourg (DE-LU)       (Energy-Charts API)
-  weather            measured weather: avg. of Swiss cities + wind at 3 locations
-                     in northern Germany                              (Open-Meteo API)
-  weather_forecasts  weather as it was forecast 2 or 3 days in advance
+  weather            measured weather: avg. of Swiss cities, wind at 3 locations
+                     in northern Germany, avg. German solar and temperature
+                                                                      (Open-Meteo API)
+  weather_forecasts  weather as it was forecast 1, 2 or 3 days in advance
                                                        (Open-Meteo Previous Runs API)
   ml_data            prices + weather + features for ML training
 App tables (filled with sample data on the first run only, never overwritten afterwards):
@@ -28,16 +29,27 @@ Data sources: api.energy-charts.info (Fraunhofer ISE) and open-meteo.com, both C
 AI notice: Created with Claude (Anthropic), reviewed and adapted by us.
 
 Installation:   pip install -r requirements.txt
-Run:            python BuildDB.py
+Run:            python BuildDB_v2.py
+
+Overview of the sections in this file:
+  Settings   locations, variables, API limits (change things here, not in the code)
+  1. Prices  load_prices: day-ahead prices CH and DE from Energy-Charts
+  2. Weather load_weather: measured weather, load_weather_forecasts: past forecasts
+  3. ML data build_ml_data: joins prices + weather and adds calendar and lag features
+  4. App     create_app_tables: tables for vehicles, tariffs etc. + sample data
+  5. Write   build_database: runs steps 1-4 and writes everything into the database
+  6. Update  update_if_needed: lets the app refresh the database automatically
 """
 
-import sqlite3
-import threading
-import time
+# Standard library
+import sqlite3                             # the database (a single file, no server needed)
+import threading                           # lock, so only one update runs at a time
+import time                                # pauses between API requests
 
-import holidays
-import pandas as pd
-import requests
+# External packages (see requirements.txt)
+import holidays                            # public holidays per country / canton
+import pandas as pd                        # tables (DataFrames)
+import requests                            # HTTP requests to the APIs
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -75,6 +87,25 @@ WIND_LOCATIONS_DE = {
     "wind_de_emden": (53.37, 7.21),        # Emden (East Frisia)
 }
 
+# Germany has by far the most solar panels in the coupled market. A sunny day
+# there pushes midday prices down (often below zero), including in Switzerland.
+# Most of the capacity is in the south and west, so we use these four states.
+# Averaged into one column "solar_de"; we only use the radiation from here.
+SOLAR_LOCATIONS_DE = {
+    "solar_de_bavaria": (48.5, 11.5),      # Bavaria
+    "solar_de_bw": (48.7, 9.0),            # Baden-Wuerttemberg
+    "solar_de_nrw": (51.5, 7.5),           # North Rhine-Westphalia
+    "solar_de_saxony": (51.0, 13.0),       # Saxony
+}
+
+# German demand (heating) also moves the price. Three large cities spread
+# across the country, averaged into one column "temperature_de".
+TEMPERATURE_LOCATIONS_DE = {
+    "temp_de_frankfurt": (50.1, 8.7),      # Frankfurt
+    "temp_de_berlin": (52.5, 13.4),        # Berlin
+    "temp_de_munich": (48.1, 11.6),        # Munich
+}
+
 # Weather values that influence the price:
 #   Temperature: cold -> more heating -> more demand -> higher price
 #   Wind:        lots of wind -> lots of wind power -> lower price. 100 m instead
@@ -86,9 +117,15 @@ WEATHER_VARIABLES = {
     "shortwave_radiation": "solar",        # W/m²
 }
 WIND_VARIABLE = "wind_speed_100m"          # the only variable we use for northern Germany
+SOLAR_VARIABLE = "shortwave_radiation"     # the only variable we use at the German solar points
+TEMPERATURE_VARIABLE = "temperature_2m"    # the only variable we use at the German cities
 
 # All measured weather columns in ml_data
-WEATHER_COLUMNS = list(WEATHER_VARIABLES.values()) + list(WIND_LOCATIONS_DE)
+#   temperature, wind_100m, solar:  Swiss average
+#   wind_de_*:                      northern Germany, one column per location
+#   solar_de, temperature_de:       German average
+WEATHER_COLUMNS = (list(WEATHER_VARIABLES.values()) + list(WIND_LOCATIONS_DE)
+                   + ["solar_de", "temperature_de"])
 
 # Pass with ALL Open-Meteo requests: wind consistently in m/s instead of km/h.
 # This avoids silent errors when sources are mixed.
@@ -105,8 +142,10 @@ WEATHER_MODEL = "ecmwf_ifs025"
 # Known inaccuracy: "2 days before" = 48 h before the target hour. For day 2 at
 # 18:00 that is day 0 at 18:00, i.e. slightly AFTER the decision at 13:00.
 # For weather forecasts the difference is small. To be strict, set
-# {"fc_d2": 3, "fc_d3": 4}.
-FORECAST_DAYS_AHEAD = {"fc_d2": 2, "fc_d3": 3}
+# {"fc_d1": 2, "fc_d2": 3, "fc_d3": 4}.
+# fc_d1 is the weather of the known day (day 1) as forecast one day ahead. The
+# model compares the target day with it ("windier than tomorrow?").
+FORECAST_DAYS_AHEAD = {"fc_d1": 1, "fc_d2": 2, "fc_d3": 3}
 
 # Bidding zones for electricity prices and the table they are stored in.
 # Swiss prices closely follow German ones (strongly coupled markets).
@@ -136,11 +175,13 @@ def fetch_json(url: str, params: dict, timeout: int = 60):
     of aborting the whole script. Other errors abort immediately, so that we do
     not continue calculating with wrong data.
     """
-    for attempt in range(5):
+    for attempt in range(5):               # at most 5 attempts
         response = requests.get(url, params=params, timeout=timeout)
         if response.status_code != 429:
             response.raise_for_status()    # other errors: abort
             return response.json()
+        # The API may tell us how long to wait ("Retry-After" header). If not, wait
+        # longer after every failed attempt: 30 s, 60 s, 120 s, ... (exponential backoff)
         retry_after = response.headers.get("Retry-After", "")
         wait = int(retry_after) if retry_after.isdigit() else 30 * 2 ** attempt
         print(f"    API limit reached, waiting {wait} s ...")
@@ -163,7 +204,8 @@ def load_stored_table(table: str) -> pd.DataFrame:
         with sqlite3.connect(DATABASE) as connection:
             old = pd.read_sql(f"SELECT * FROM {table}", connection)
     except (sqlite3.Error, pd.errors.DatabaseError):
-        return pd.DataFrame()
+        return pd.DataFrame()              # table (or database) does not exist yet
+    # Stored as text in the DB -> convert back to real timestamps (in UTC)
     old["time_utc"] = pd.to_datetime(old["time_utc"], format=TIME_FORMAT, utc=True)
     return old
 
@@ -172,6 +214,7 @@ def reload_start(old: pd.DataFrame) -> pd.Timestamp:
     """From when to reload: everything on the first run, otherwise the last 14 days."""
     start = pd.Timestamp(START)
     if not old.empty:
+        # Last stored day (time-zone info removed, time set to 00:00)
         last = old["time_utc"].max().tz_convert(None).normalize()
         start = max(start, last - pd.Timedelta(days=RELOAD_DAYS))
         print(f"  {len(old)} hours from the database, reloading from {start:%Y-%m-%d}")
@@ -193,11 +236,14 @@ def load_prices(zone: str = "CH") -> pd.DataFrame:
     start = reload_start(old)
 
     # Query in blocks of PRICE_BLOCK_DAYS
-    parts = []
+    parts = []                             # one DataFrame per block, joined at the end
     block_start = start
     while block_start <= end:
+        # Block end: 90 days later, but never beyond tomorrow
         block_end = min(block_start + pd.Timedelta(days=PRICE_BLOCK_DAYS - 1), end)
         print(f"  Prices {zone} {block_start:%Y-%m-%d} to {block_end:%Y-%m-%d} ...")
+        # bzn = bidding zone. The API returns two lists of equal length:
+        # "unix_seconds" (time stamps) and "price" (EUR/MWh)
         data = fetch_json("https://api.energy-charts.info/price",
                           {"bzn": zone, "start": block_start.strftime("%Y-%m-%d"),
                            "end": block_end.strftime("%Y-%m-%d")})
@@ -205,10 +251,11 @@ def load_prices(zone: str = "CH") -> pd.DataFrame:
             "time_utc": pd.to_datetime(data["unix_seconds"], unit="s", utc=True),
             "price_eur_mwh": data["price"],
         }))
-        block_start = block_end + pd.Timedelta(days=1)
+        block_start = block_end + pd.Timedelta(days=1)   # next block starts the day after
         if block_start <= end:
-            time.sleep(PAUSE_SECONDS)
+            time.sleep(PAUSE_SECONDS)      # pause only if another request follows
 
+    # Join the blocks; drop empty prices and hours that appear twice at block borders
     new = pd.concat(parts).dropna().drop_duplicates("time_utc")
 
     # Since October 2025 there are prices per 15 minutes. Model and app work in
@@ -232,15 +279,18 @@ def load_prices(zone: str = "CH") -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def fetch_weather_all_locations(url: str, hourly: list[str], params: dict) -> pd.DataFrame:
     """
-    Loads the weather for all locations (Switzerland + northern Germany) with a
-    single request. Open-Meteo allows several locations per request
-    (comma-separated coordinates). One request instead of eight spares the API limit.
+    Loads the weather for all locations (Switzerland + Germany) with a single
+    request. Open-Meteo allows several locations per request (comma-separated
+    coordinates). One request instead of fifteen spares the API limit.
     The API requests the same variables for all locations. That costs nothing
-    extra (Open-Meteo only counts double from 10 variables), but for northern
-    Germany only the wind is used afterwards (see combine_locations).
+    extra (Open-Meteo only counts double from 10 variables), but for the German
+    locations only one variable each is used afterwards (see combine_locations).
     Returns: one row per location and hour, columns "location", "time_utc" + hourly
     """
-    locations = {**WEATHER_LOCATIONS, **WIND_LOCATIONS_DE}
+    # Merge all location dictionaries into one (name -> (latitude, longitude))
+    locations = {**WEATHER_LOCATIONS, **WIND_LOCATIONS_DE,
+                 **SOLAR_LOCATIONS_DE, **TEMPERATURE_LOCATIONS_DE}
+    # e.g. latitude="47.37,46.95,..." and longitude="8.54,7.45,..."
     latitudes = ",".join(str(lat) for lat, _ in locations.values())
     longitudes = ",".join(str(lon) for _, lon in locations.values())
     data = fetch_json(url, {"latitude": latitudes, "longitude": longitudes,
@@ -260,19 +310,43 @@ def fetch_weather_all_locations(url: str, hourly: list[str], params: dict) -> pd
 def combine_locations(raw: pd.DataFrame, api_suffix: str = "", suffix: str = "") -> pd.DataFrame:
     """
     Turns one row per location and hour into one row per hour:
-      Swiss cities:      average -> temperature, wind_100m, solar
-      Northern Germany:  wind only, one column per location -> wind_de_hamburg, ...
+      Swiss cities:        average -> temperature, wind_100m, solar
+      Northern Germany:    wind only, one column per location -> wind_de_hamburg, ...
+      German solar points: radiation only, average -> solar_de
+      German cities:       temperature only, average -> temperature_de
     api_suffix: suffix of the API variables (e.g. "_previous_day2")
     suffix:     suffix of our columns (e.g. "_fc_d2")
     """
+    # Renaming table API name -> our name, e.g. "temperature_2m_previous_day2" -> "temperature_fc_d2"
     names = {api + api_suffix: column + suffix for api, column in WEATHER_VARIABLES.items()}
+    # Switzerland: average over the 5 cities, per hour
     switzerland = raw[raw["location"].isin(WEATHER_LOCATIONS)]
     result = switzerland.groupby("time_utc")[list(names)].mean().rename(columns=names)
 
+    # Northern German wind: pivot turns the locations into columns (one per location)
     germany = raw[raw["location"].isin(WIND_LOCATIONS_DE)]
     wind_de = germany.pivot(index="time_utc", columns="location", values=WIND_VARIABLE + api_suffix)
     wind_de = wind_de[list(WIND_LOCATIONS_DE)].add_suffix(suffix)  # fixed column order
-    return result.join(wind_de, how="outer")
+
+    # German solar and temperature: one average column each
+    solar_de = average_all_present(raw, SOLAR_LOCATIONS_DE, SOLAR_VARIABLE + api_suffix)
+    temperature_de = average_all_present(raw, TEMPERATURE_LOCATIONS_DE,
+                                         TEMPERATURE_VARIABLE + api_suffix)
+    # Put all parts side by side (same hours as index); "outer" keeps every hour
+    return result.join([wind_de, solar_de.rename("solar_de" + suffix),
+                        temperature_de.rename("temperature_de" + suffix)], how="outer")
+
+
+def average_all_present(raw: pd.DataFrame, locations: dict, variable: str) -> pd.Series:
+    """
+    Average of one variable over a group of locations, per hour.
+    If a single location is missing, the average would silently be based on
+    fewer points (e.g. only the sunny south). Then the hour stays empty instead.
+    """
+    group = raw[raw["location"].isin(locations)].groupby("time_utc")[variable]
+    # count() = number of locations with a value in this hour.
+    # where(...) keeps the mean only if all locations are present, otherwise NaN.
+    return group.mean().where(group.count() == len(locations))
 
 
 def load_weather() -> pd.DataFrame:
@@ -285,11 +359,13 @@ def load_weather() -> pd.DataFrame:
     Returns: time_utc, temperature, wind_100m, solar, wind_de_*, is_forecast
     """
     print("  Weather archive (all locations) ...")
+    # Archive: measured values from START until 6 days ago (newer ones are not final yet)
     archive = fetch_weather_all_locations(
         "https://archive-api.open-meteo.com/v1/archive", list(WEATHER_VARIABLES),
         {"start_date": START, "end_date": (today() - pd.Timedelta(days=6)).strftime("%Y-%m-%d")})
     time.sleep(PAUSE_SECONDS)
     print("  Weather forecast (all locations) ...")
+    # Forecast API: the last 7 days (closes the gap to the archive) + the next 4 days
     forecast = fetch_weather_all_locations(
         "https://api.open-meteo.com/v1/forecast", list(WEATHER_VARIABLES),
         {"past_days": 7, "forecast_days": 4})
@@ -319,9 +395,18 @@ def load_weather_forecasts() -> pd.DataFrame:
     Returns: time_utc + for each weather column the variants _fc_d2 and _fc_d3
     """
     old = load_stored_table("weather_forecasts")
+    # New locations or lead times added to the settings? Then the stored table
+    # lacks these columns and everything has to be reloaded once, otherwise
+    # the new columns would only be filled for the last 14 days.
+    expected = [f"{column}_{suffix}" for suffix in FORECAST_DAYS_AHEAD for column in WEATHER_COLUMNS]
+    if not old.empty and not set(expected) <= set(old.columns):
+        print("  New weather columns in the settings, reloading all forecasts ...")
+        old = pd.DataFrame()
     start = reload_start(old)
     end = today() + pd.Timedelta(days=3)
 
+    # Variable names of the Previous Runs API, e.g. "wind_speed_100m_previous_day2"
+    # = wind speed as forecast 2 days before the hour. One per variable and lead time.
     hourly = [f"{v}_previous_day{days}"
               for v in WEATHER_VARIABLES for days in sorted(set(FORECAST_DAYS_AHEAD.values()))]
     print(f"  Weather forecasts {WEATHER_MODEL} {start:%Y-%m-%d} to {end:%Y-%m-%d} (all locations) ...")
@@ -330,6 +415,7 @@ def load_weather_forecasts() -> pd.DataFrame:
         {"start_date": start.strftime("%Y-%m-%d"), "end_date": end.strftime("%Y-%m-%d"),
          "models": WEATHER_MODEL})
 
+    # One table per lead time (fc_d1, fc_d2, fc_d3), then put them side by side (axis=1)
     parts = [combine_locations(raw, f"_previous_day{days}", f"_{suffix}")
              for suffix, days in FORECAST_DAYS_AHEAD.items()]
     new = pd.concat(parts, axis=1).round(2).rename_axis("time_utc").reset_index()
@@ -365,6 +451,8 @@ def build_ml_data(prices: pd.DataFrame, prices_de: pd.DataFrame,
                               today().tz_convert("UTC") + pd.Timedelta(days=4),
                               freq="h", inclusive="left")
     data = pd.DataFrame({"time_utc": all_hours})
+    # Attach prices and weather to the hour list. "left" keeps every hour, even
+    # if there is no price yet (future) -> the value stays empty (NaN)
     data = (data.merge(prices, on="time_utc", how="left")
                 .merge(weather, on="time_utc", how="left")
                 .merge(weather_forecasts, on="time_utc", how="left"))
@@ -417,9 +505,11 @@ def build_ml_data(prices: pd.DataFrame, prices_de: pd.DataFrame,
         data = data.merge(earlier.rename(columns={"price_rp_kwh": f"price_de_lag_{hours}h"}),
                           on="time_utc", how="left")
 
+    # Names of all forecast columns, e.g. "wind_de_hamburg_fc_d2"
     forecast_columns = [f"{column}_{suffix}"
                         for suffix in FORECAST_DAYS_AHEAD for column in WEATHER_COLUMNS]
-    data["time_utc"] = data["time_utc"].dt.strftime(TIME_FORMAT)
+    data["time_utc"] = data["time_utc"].dt.strftime(TIME_FORMAT)   # timestamp -> text for SQLite
+    # Return the columns in a fixed, readable order
     return data[["time_utc", "time_local", "price_rp_kwh",
                  "hour", "weekday", "weekend", "holiday_ch", "holiday_de", "month",
                  *WEATHER_COLUMNS, "is_forecast",
@@ -536,11 +626,13 @@ def create_app_tables(connection) -> None:
     overwritten in the process.
     """
     connection.executescript(APP_TABLES)   # "IF NOT EXISTS": only create if missing
-    cur = connection.cursor()
+    cur = connection.cursor()              # cursor = object that runs SQL statements
 
     if cur.execute("SELECT COUNT(*) FROM tariffs").fetchone()[0] > 0:
         return                             # already filled -> don't touch user input
 
+    # executemany runs the same INSERT once per list entry; "?" are placeholders
+    # that sqlite3 fills in safely (no manual string building -> no SQL injection)
     cur.executemany("""INSERT INTO tariffs (name, surcharge_rp_kwh, peak_surcharge_rp_kwh,
                        peak_start, peak_end, source) VALUES (?, ?, ?, ?, ?, ?)""", SAMPLE_TARIFFS)
     cur.executemany("""INSERT INTO vehicle_types (name, battery_kwh, consumption_kwh_100km,
@@ -550,6 +642,7 @@ def create_app_tables(connection) -> None:
                        battery_percent, min_reserve_percent) VALUES (?, ?, ?, ?, ?, ?)""",
                     (name, type_id, arrival, departure, battery, reserve))
         vehicle_id = cur.lastrowid         # ID of the vehicle just created, for the schedule
+        # One schedule row per weekday: enumerate gives (0, km Monday), (1, km Tuesday), ...
         cur.executemany("INSERT INTO schedule VALUES (?, ?, ?)",
                         [(vehicle_id, day, km) for day, km in enumerate(km_per_day)])
     cur.executemany("INSERT INTO settings VALUES (?, ?)", SAMPLE_SETTINGS)
@@ -582,6 +675,7 @@ def build_database() -> None:
         # already contains the old prices from the database.
         for table, df in [("prices_ch", prices), ("prices_de", prices_de),
                           ("weather", weather), ("weather_forecasts", weather_forecasts)]:
+            # Times as text (TIME_FORMAT), then write the whole table to SQLite
             df.assign(time_utc=df["time_utc"].dt.strftime(TIME_FORMAT)).to_sql(
                 table, connection, if_exists="replace", index=False)
         ml_data.to_sql("ml_data", connection, if_exists="replace", index=False)
@@ -631,9 +725,10 @@ def update_if_needed() -> str | None:
     Tries at most every 30 minutes: sometimes the prices only appear after
     13:00, and otherwise every click in the app would trigger an API request.
     """
-    global _last_attempt
+    global _last_attempt                   # we change the module-level variable below
     if is_up_to_date():
         return None
+    # Only one thread at a time may enter this block; others wait here
     with _lock:
         if is_up_to_date():                # updated by someone else in the meantime
             return None
@@ -651,59 +746,40 @@ def update_if_needed() -> str | None:
     return None
 
 
-# Start by hand: python BuildDB.py
+# Start by hand: python BuildDB_v2.py
 if __name__ == "__main__":
     build_database()
 
 
 # ===========================================================================
-# GUIDE 1: ML MODEL  (file still to be created, e.g. ml_model.py)
+# GUIDE 1: ML MODEL  (full plan: ML_CONCEPT.md)
 # ===========================================================================
 #
-# GOAL
-#   Predict the exchange price for the day after tomorrow and the day after
-#   that, and write it to the "predictions" table. As long as it is empty, the
-#   app uses the price of the previous week as a placeholder.
+# What this script provides for the ML model (data contract):
 #
-# INPUT: table "ml_data" (one row per hour, times in UTC)
-#   Label:     price_rp_kwh
-#   Features:  hour, weekday, weekend, holiday_ch, holiday_de, month,
-#              price_lag_24h, price_lag_48h, price_lag_168h,
-#              price_de_lag_24h, price_de_lag_48h, price_de_lag_168h,
-#              weather as forecast (see below)
-#   Measured weather (only for the comparison "measured vs. forecast"):
-#              temperature, wind_100m (m/s), solar,
+# INPUT: table "ml_data" (one row per UTC hour)
+#   Label:     price_rp_kwh (Swiss price, Rp./kWh), empty for hours still to predict
+#   Calendar:  hour, weekday, weekend, month, holiday_ch, holiday_de (local time)
+#   Prices:    price_lag_* / price_de_lag_* (shifted in UTC). The ML concept
+#              builds its price features from a local-time grid instead.
+#   Weather as forecast (use these):
+#              temperature, wind_100m, solar          (Swiss average)
 #              wind_de_hamburg, wind_de_husum, wind_de_emden (m/s)
-#   Weather as forecast: the same columns with suffix _fc_d2 (forecast 2 days
-#              in advance) or _fc_d3 (3 days in advance), e.g.
-#              temperature_fc_d2, wind_de_hamburg_fc_d3.
-#              Model ecmwf_ifs025, complete only from approx. 9.3.2024.
+#              solar_de, temperature_de               (German average)
+#              each with suffix _fc_d1 / _fc_d2 / _fc_d3 = forecast made
+#              1 / 2 / 3 days before the hour. Model ecmwf_ifs025, complete
+#              from approx. 9.3.2024.
+#   Measured weather (same names without suffix): only for comparisons,
+#              never as features (data leakage).
 #   Not features: time_utc, time_local, is_forecast
-#
-# TWO MODELS (because of data leakage)
-#   "day after tomorrow":  without price_lag_48h / price_de_lag_48h, weather *_fc_d2
-#   "day after that":      without price_lag_24h / price_de_lag_24h, weather *_fc_d3
-#
-# TRAINING
-#   - Only rows with price_rp_kwh, drop rows with missing features.
-#   - Split by time, not randomly (e.g. last 3 months = test).
-#   - Compare with baseline "price = price_lag_168h" (MAE in Rp./kWh).
-#     The model must be better.
-#   - Suggestion: sklearn RandomForestRegressor or HistGradientBoostingRegressor
-#     (add scikit-learn to requirements.txt).
-#
-# PREDICTION: rows without price_rp_kwh
-#   price_lag_24h present                  -> "day after tomorrow" model
-#   price_lag_24h empty, _48h present      -> "day after that" model
-#   With the _fc columns, the weather in training and prediction is the same
-#   kind (both forecasts), so the test is honest.
 #
 # OUTPUT: table "predictions"
 #   created_at (text, TIME_FORMAT), time_utc (as in ml_data), predicted_rp_kwh
 #   Append (INSERT OR REPLACE / if_exists="append"), NEVER "replace":
 #   old predictions are needed by the "Prediction quality" tab.
+#   As long as it is empty, the app uses last week's price as a placeholder.
 #
-# PROCESS: run daily after BuildDB.py.
+# PROCESS: run daily after BuildDB_v2.py.
 #
 #
 # ===========================================================================
@@ -720,13 +796,13 @@ if __name__ == "__main__":
 #
 # AUTOMATIC UPDATE
 #   The app can keep the database up to date by itself. Then nobody has to
-#   start BuildDB.py by hand. In app.py, BEFORE the "database not found"
+#   start BuildDB_v2.py by hand. In app.py, BEFORE the "database not found"
 #   check, insert:
 #
-#       import BuildDB
+#       import BuildDB_v2
 #
 #       with st.spinner("Checking whether new electricity prices are available ..."):
-#           notice = BuildDB.update_if_needed()
+#           notice = BuildDB_v2.update_if_needed()
 #       if notice:
 #           st.info(notice)
 #
