@@ -11,13 +11,12 @@ import BuildDB
 from daten import data_source, database_ready, get_tariffs, save_setting
 from ui_helpers import chosen_tariff, company, describe_tariff, init_state
 # 
-st.set_page_config(page_title="Fleet charging", page_icon=":material/ev_station:", layout="wide")
+st.set_page_config(page_title="VOLT", page_icon=":material/ev_station:", layout="wide")
 
 # this is supposed to add our own simple Logo (images/), shown at the top of the sidebar. 
 # icon_image is the small version for when the sidebar is closed. 
 IMAGES = Path(__file__).parent / "images" # the folder images/ 
-st.logo(IMAGES / "logo.svg", icon_image=IMAGES / "icon.svg", size="large") 
-
+st.logo(IMAGES / "logo.png", icon_image=IMAGES / "icon.png", size="large")
 # The menu: Each page is a file in pages/. 
 # A dictionary makes groups: "" has no heading, "Settings" gets a small heading.
 pages = {
