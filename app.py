@@ -22,7 +22,7 @@ st.logo(IMAGES / "logo.png", icon_image=IMAGES / "icon.png", size="large")
 pages = {
     "": [
         st.Page("pages/1_Prices.py", title="Prices", icon=":material/show_chart:", default=True),
-        st.Page("pages/2_Vans.py", title="Vans", icon=":material/local_shipping:"),
+        st.Page("pages/2_Fleet.py", title="Fleet", icon=":material/local_shipping:"),
         st.Page("pages/3_Plan.py", title="Plan", icon=":material/battery_charging_full:"),
         st.Page("pages/4_Depot.py", title="Depot", icon=":material/ev_station:"),
         st.Page("pages/6_Forecast.py", title="Forecast", icon=":material/insights:"),

@@ -1,0 +1,66 @@
+# Look of the whole app: calm and familiar, like Apple's own apps
+# (white or black pages, grey panels, one blue accent, a clean sans-serif font).
+# Only Streamlit's built-in theme options, no extra CSS.
+# Generated with Claude (Anthropic) on 19 Nov 2026, new look on 27 Nov 2026,
+# light and dark mode on 27 Nov 2026.
+#
+# Light and dark mode: because both [theme.light] and [theme.dark] exist,
+# the app follows the computer's setting (like macOS and iOS), and the user
+# can switch in the menu at the top right (⋮ > Settings > Theme).
+
+[theme]
+# Shared by both modes: font, headings and round corners
+# Inter looks close to Apple's San Francisco font and is free (Google Fonts).
+# Without internet the app falls back to the computer's normal sans-serif font.
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap, sans-serif"
+headingFontWeights = [700, 600, 600, 600, 600, 600]
+baseRadius = "12px"
+buttonRadius = "full"                # round "pill" buttons like on apple.com
+
+[theme.light]
+primaryColor = "#0071E3"             # Apple blue: buttons, links, selected items
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F5F7" # Apple's light grey for panels and inputs
+textColor = "#1D1D1F"
+borderColor = "#E5E5EA"
+# The colours of the price levels: green = cheap, orange = medium, red = expensive
+greenColor = "#248A3D"
+orangeColor = "#B26B00"              # amber, so it is easy to tell apart from red
+redColor = "#D70015"
+blueColor = "#0071E3"
+grayColor = "#6E6E73"
+# Same colours for coloured text (otherwise Streamlit makes them darker)
+greenTextColor = "#248A3D"
+orangeTextColor = "#B26B00"
+redTextColor = "#D70015"
+chartCategoricalColors = ["#0071E3", "#34C759", "#FF9500", "#AF52DE", "#5AC8FA", "#8E8E93"]
+
+[theme.light.sidebar]
+backgroundColor = "#F5F5F7"
+secondaryBackgroundColor = "#FFFFFF"
+
+[theme.dark]
+# Apple's dark mode colours: black page, dark grey panels, brighter accents
+primaryColor = "#0A84FF"
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#1C1C1E"
+textColor = "#F5F5F7"
+borderColor = "#38383A"
+greenColor = "#30D158"
+orangeColor = "#FF9F0A"
+redColor = "#FF453A"
+blueColor = "#0A84FF"
+grayColor = "#98989D"
+greenTextColor = "#30D158"
+orangeTextColor = "#FF9F0A"
+redTextColor = "#FF453A"
+chartCategoricalColors = ["#0A84FF", "#30D158", "#FF9F0A", "#BF5AF2", "#64D2FF", "#98989D"]
+
+[theme.dark.sidebar]
+backgroundColor = "#1C1C1E"
+secondaryBackgroundColor = "#2C2C2E"
+
+[client]
+# "viewer": no "Deploy" button and no developer options, but the menu with
+# the light/dark switch stays at the top right.
+toolbarMode = "viewer"
